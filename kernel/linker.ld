@@ -8,19 +8,16 @@
  *   0x10000000               UART0 (NS16550A)
  *   0x80000000               DRAM start
  *
- * OpenSBI (the M-mode firmware) loads at 0x80000000 and jumps to
- * the next-stage payload at 0x80200000 in S-mode.  That is where
- * our kernel lives.
+ * Boot flow with U-Boot:
+ *   0x80000000  U-Boot (M-mode firmware + bootloader)
+ *   0x80200000  Our kernel (loaded from virtio disk by U-Boot, then `go`)
  */
 
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-/*
- * No rv32 OpenSBI available in this QEMU build.
- * We boot directly at 0x80000000 in M-mode with -bios none.
- */
-KERNEL_BASE = 0x80000000;
+/* U-Boot lives at 0x80000000; kernel is loaded here by U-Boot. */
+KERNEL_BASE = 0x80200000;
 
 SECTIONS
 {
@@ -28,8 +25,8 @@ SECTIONS
 
     /*
      * ---- boot vector ----
-     * QEMU (with -bios none) always starts execution at 0x80000000.
-     * Place a single 32-bit jump here to reach _start wherever it lands.
+     * U-Boot's `go 0x80200000` jumps directly to this address.
+     * Place a 32-bit unconditional jump so _start can follow at any offset.
      */
     .text.boot : {
         *(.text.boot)
@@ -37,7 +34,6 @@ SECTIONS
 
     /* ---- text ---- */
     .text : {
-        /* Entry point must be immediately after the boot vector */
         *(.text.init)
         *(.text .text.*)
     }
@@ -67,10 +63,9 @@ SECTIONS
     . += 0x10000;
     _stack_top = .;
 
-    /* Discard everything the C runtime would normally need */
     /DISCARD/ : {
         *(.eh_frame)
         *(.comment)
-        *(.note.gnu.build-id)   /* prevent build-id landing at 0x80000000 */
+        *(.note.gnu.build-id)
     }
 }

@@ -1,14 +1,14 @@
 # =============================================================================
 # RV32 Hobby OS — Makefile
 #
-# Toolchain: riscv64-linux-gnu-gcc with -march=rv32imac / -mabi=ilp32
-#            (Ubuntu ships only an rv64 cross-compiler; it can still generate
-#             rv32 code when given the right -march/-mabi flags and
-#             -ffreestanding / -nostdlib.)
+# Boot flow:
+#   QEMU → U-Boot (boot/u-boot.bin, M-mode, 0x80000000)
+#        → boot.scr (FAT on virtio disk)
+#        → fatload kernel.bin → 0x80200000
+#        → go 0x80200000  (our kernel, M-mode)
 #
-# QEMU:      qemu-system-riscv32  -machine virt  -bios default
-#            "default" bios = OpenSBI, which provides M-mode firmware and
-#            jumps to our kernel at 0x80200000 in S-mode.
+# Toolchain: riscv64-linux-gnu-gcc with -march=rv32imac_zicsr / -mabi=ilp32
+#            (Ubuntu's rv64 cross-compiler can emit rv32 with the right flags.)
 # =============================================================================
 
 # ----------------------------------------------------------------------------
@@ -16,47 +16,39 @@
 # ----------------------------------------------------------------------------
 CROSS   := riscv64-linux-gnu-
 CC      := $(CROSS)gcc
-AS      := $(CROSS)gcc       # use GCC as the assembler front-end
-LD      := $(CROSS)gcc       # use GCC as the linker front-end
+AS      := $(CROSS)gcc
+LD      := $(CROSS)gcc
 OBJCOPY := $(CROSS)objcopy
 OBJDUMP := $(CROSS)objdump
 SIZE    := $(CROSS)size
+MKIMAGE := mkimage
 
 # ----------------------------------------------------------------------------
 # Target architecture flags
-#   rv32imac_zicsr  — RV32 base + integer multiply/divide + atomic +
-#                     compressed instructions + Zicsr (CSR instructions)
-#   ilp32           — 32-bit integer / 32-bit pointers ABI
 # ----------------------------------------------------------------------------
 ARCH_FLAGS := -march=rv32imac_zicsr -mabi=ilp32
 
-# ----------------------------------------------------------------------------
-# Compiler flags
-# ----------------------------------------------------------------------------
-CFLAGS  := $(ARCH_FLAGS)        \
-            -mcmodel=medany     \
-            -ffreestanding      \
-            -fno-stack-protector\
-            -fno-pic            \
-            -nostdlib           \
-            -nostdinc           \
-            -O2                 \
-            -Wall               \
-            -Wextra             \
+CFLAGS  := $(ARCH_FLAGS)         \
+            -mcmodel=medany      \
+            -ffreestanding       \
+            -fno-stack-protector \
+            -fno-pic             \
+            -nostdlib            \
+            -nostdinc            \
+            -O2                  \
+            -Wall                \
+            -Wextra              \
             -Ikernel
 
-ASFLAGS := $(ARCH_FLAGS)        \
-            -mcmodel=medany     \
-            -ffreestanding      \
-            -nostdlib           \
+ASFLAGS := $(ARCH_FLAGS)         \
+            -mcmodel=medany      \
+            -ffreestanding       \
+            -nostdlib            \
             -nostdinc
 
-# ----------------------------------------------------------------------------
-# Linker flags
-# ----------------------------------------------------------------------------
-LDFLAGS := $(ARCH_FLAGS)        \
-            -T kernel/linker.ld \
-            -nostdlib           \
+LDFLAGS := $(ARCH_FLAGS)         \
+            -T kernel/linker.ld  \
+            -nostdlib            \
             -static
 
 # ----------------------------------------------------------------------------
@@ -66,8 +58,7 @@ KERNEL_SRCS_S := kernel/start.S
 KERNEL_SRCS_C := kernel/uart.c \
                  kernel/main.c
 
-KERNEL_OBJS   := $(KERNEL_SRCS_S:.S=.o) \
-                 $(KERNEL_SRCS_C:.c=.o)
+KERNEL_OBJS := $(KERNEL_SRCS_S:.S=.o) $(KERNEL_SRCS_C:.c=.o)
 
 # ----------------------------------------------------------------------------
 # Output artefacts
@@ -75,101 +66,146 @@ KERNEL_OBJS   := $(KERNEL_SRCS_S:.S=.o) \
 KERNEL_ELF  := kernel.elf
 KERNEL_BIN  := kernel.bin
 KERNEL_DUMP := kernel.dump
+BOOT_SCR    := boot/boot.scr
+BOOT_SOURCE := boot/boot.source
+DISK_IMG    := disk.img
+UBOOT_BIN   := boot/u-boot.bin
+
+# Partition geometry (matches disk.img layout)
+PART_START  := 2048
+PART_SECTS  := 28672
 
 # ----------------------------------------------------------------------------
-# QEMU settings
+# QEMU settings — U-Boot boot flow
+#   -m 256M   : U-Boot's default scriptaddr (0x8c100000) needs >192MB DRAM
+#   -bios     : U-Boot binary (M-mode firmware + bootloader)
+#   -drive    : virtio block device containing FAT partition with kernel.bin
 # ----------------------------------------------------------------------------
-QEMU        := qemu-system-riscv32
-QEMU_MACHINE:= virt
-QEMU_BIOS   := none             # no rv32 OpenSBI; we boot directly in M-mode
-QEMU_FLAGS  := -machine $(QEMU_MACHINE) \
-               -bios $(QEMU_BIOS)       \
-               -kernel $(KERNEL_ELF)    \
-               -m 128M                  \
-               -nographic              \
-               -serial mon:stdio
+QEMU         := qemu-system-riscv32
+QEMU_FLAGS   := -machine virt                            \
+                -bios $(UBOOT_BIN)                       \
+                -m 256M                                  \
+                -nographic                               \
+                -serial mon:stdio                        \
+                -drive file=$(DISK_IMG),format=raw,id=hd0\
+                -device virtio-blk-device,drive=hd0
 
-# GDB stub listens on localhost:1234
 QEMU_DEBUG_FLAGS := $(QEMU_FLAGS) -S -gdb tcp::1234
 
 # ----------------------------------------------------------------------------
-# Default target
+# Default target: build everything needed to run
 # ----------------------------------------------------------------------------
 .PHONY: all
-all: $(KERNEL_ELF)
+all: $(KERNEL_ELF) $(KERNEL_BIN) $(BOOT_SCR) $(DISK_IMG)
+	@echo ""
+	@echo "  Boot chain ready."
+	@echo "  Run:   make run      (Ctrl-A then X to quit QEMU)"
+	@echo "  Debug: make run-gdb  (then attach gdb-multiarch)"
 
 # ----------------------------------------------------------------------------
-# Link the kernel ELF
+# Kernel ELF
 # ----------------------------------------------------------------------------
 $(KERNEL_ELF): $(KERNEL_OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^
 	$(SIZE) $@
-	@echo ""
-	@echo "  Built: $@"
-	@echo "  Run:   make run"
-	@echo "  Debug: make debug  (then: gdb-multiarch kernel.elf)"
 
-# ----------------------------------------------------------------------------
-# Compile assembly files
-# ----------------------------------------------------------------------------
 %.o: %.S
 	$(AS) $(ASFLAGS) -c -o $@ $<
 
-# ----------------------------------------------------------------------------
-# Compile C files
-# ----------------------------------------------------------------------------
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ----------------------------------------------------------------------------
-# Raw binary (useful for inspection)
+# Raw kernel binary (stripped from ELF, placed at 0x80200000 by U-Boot)
 # ----------------------------------------------------------------------------
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $< $@
 
 # ----------------------------------------------------------------------------
-# Disassembly listing
+# U-Boot boot script
+#   boot.source  — human-readable script (fatload + go)
+#   boot.scr     — compiled U-Boot image (mkimage -T script)
+# U-Boot's distro_bootcmd scans FAT partitions for /boot.scr first.
 # ----------------------------------------------------------------------------
-$(KERNEL_DUMP): $(KERNEL_ELF)
-	$(OBJDUMP) -D -M no-aliases -M numeric $< > $@
+$(BOOT_SOURCE):
+	@echo "# RV32 Hobby OS boot script"                         > $@
+	@echo "echo '=== RV32 Hobby OS boot script ==='"           >> $@
+	@echo "echo 'Loading kernel.bin to 0x80200000 ...'"        >> $@
+	@echo "fatload virtio 0:1 0x80200000 /kernel.bin"          >> $@
+	@echo "echo 'Jumping to kernel at 0x80200000 ...'"         >> $@
+	@echo "go 0x80200000"                                       >> $@
 
-.PHONY: dump
-dump: $(KERNEL_DUMP)
-	@echo "Disassembly written to $(KERNEL_DUMP)"
+$(BOOT_SCR): $(BOOT_SOURCE)
+	$(MKIMAGE) -T script -A riscv -O linux -C none \
+	           -n "RV32 Hobby OS" -d $< $@
 
 # ----------------------------------------------------------------------------
-# Run in QEMU (Ctrl-A X to quit)
+# Disk image (FAT16 on MBR partition, 16 MB total)
+#   Layout:
+#     Sector 0-2047   : MBR + reserved  (1 MB)
+#     Sector 2048+    : FAT16 partition (14 MB)
+#   Files on FAT:
+#     /kernel.bin     : raw RV32 kernel binary (U-Boot fatloads this)
+#     /boot.scr       : compiled U-Boot boot script
+# ----------------------------------------------------------------------------
+$(DISK_IMG): $(KERNEL_BIN) $(BOOT_SCR)
+	@echo "Building disk image $@ ..."
+	# 1. Blank 16 MB image
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	# 2. MBR partition table: one bootable FAT32 (type=b) partition
+	printf 'label: dos\ndisk.img1 : start=$(PART_START), size=$(PART_SECTS), type=b, bootable\n' \
+	    | sfdisk $@ >/dev/null 2>&1
+	# 3. Extract partition area, format as FAT16, populate, re-insert
+	dd if=$@ of=part1.img bs=512 skip=$(PART_START) count=$(PART_SECTS) 2>/dev/null
+	mkfs.vfat -F 16 -n "HOBBYOS" part1.img >/dev/null 2>&1
+	mmd    -i part1.img ::/boot    2>/dev/null || true
+	mcopy  -i part1.img $(KERNEL_BIN) ::/kernel.bin
+	mcopy  -i part1.img $(BOOT_SCR)   ::/boot.scr
+	dd if=part1.img of=$@ bs=512 seek=$(PART_START) conv=notrunc 2>/dev/null
+	rm -f part1.img
+	@echo "  Created $@  (FAT16, $(KERNEL_BIN) + $(BOOT_SCR))"
+
+# ----------------------------------------------------------------------------
+# Run (Ctrl-A then X to quit QEMU)
 # ----------------------------------------------------------------------------
 .PHONY: run
-run: $(KERNEL_ELF)
-	@echo "Starting QEMU... (press Ctrl-A then X to quit)"
+run: all
+	@echo "Starting QEMU with U-Boot ... (Ctrl-A then X to quit)"
 	$(QEMU) $(QEMU_FLAGS)
 
 # ----------------------------------------------------------------------------
-# Run in QEMU with GDB stub (non-interactive)
+# GDB stub mode — QEMU waits for debugger connection on :1234
 # ----------------------------------------------------------------------------
 .PHONY: run-gdb
-run-gdb: $(KERNEL_ELF)
+run-gdb: all
 	@echo "QEMU waiting for GDB on :1234 ..."
 	$(QEMU) $(QEMU_DEBUG_FLAGS)
 
 # ----------------------------------------------------------------------------
-# Debug: launch QEMU in background and attach gdb-multiarch
+# Launch QEMU + attach gdb-multiarch automatically
 # ----------------------------------------------------------------------------
 .PHONY: debug
-debug: $(KERNEL_ELF)
-	@echo "Launching QEMU with GDB stub on :1234 (background)"
+debug: all
+	@echo "Launching QEMU with GDB stub (background) ..."
 	$(QEMU) $(QEMU_DEBUG_FLAGS) &
 	@sleep 0.5
-	gdb-multiarch                          \
-	    -ex "set architecture riscv:rv32"  \
-	    -ex "target remote :1234"          \
-	    -ex "file $(KERNEL_ELF)"           \
-	    -ex "break kernel_main"            \
+	gdb-multiarch                         \
+	    -ex "set architecture riscv:rv32" \
+	    -ex "target remote :1234"         \
+	    -ex "file $(KERNEL_ELF)"          \
+	    -ex "break kernel_main"           \
 	    -ex "continue"
 
 # ----------------------------------------------------------------------------
-# Show symbols and section sizes
+# Disassembly
+# ----------------------------------------------------------------------------
+.PHONY: dump
+dump: $(KERNEL_ELF)
+	$(OBJDUMP) -D -M no-aliases -M numeric $(KERNEL_ELF) > $(KERNEL_DUMP)
+	@echo "Disassembly written to $(KERNEL_DUMP)"
+
+# ----------------------------------------------------------------------------
+# Symbol / size info
 # ----------------------------------------------------------------------------
 .PHONY: info
 info: $(KERNEL_ELF)
@@ -185,4 +221,5 @@ info: $(KERNEL_ELF)
 .PHONY: clean
 clean:
 	rm -f $(KERNEL_OBJS) $(KERNEL_ELF) $(KERNEL_BIN) $(KERNEL_DUMP)
+	rm -f $(DISK_IMG) $(BOOT_SCR) $(BOOT_SOURCE) part1.img
 	@echo "Cleaned."

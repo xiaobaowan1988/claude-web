@@ -1,12 +1,12 @@
 /*
  * main.c — kernel entry point (C portion, M-mode)
  *
- * Called from start.S after the stack is set up and BSS is zeroed.
- * We are running in Machine mode (M-mode) — the highest RISC-V privilege.
+ * Boot flow:
+ *   QEMU → U-Boot (0x80000000, M-mode) → kernel (0x80200000, M-mode)
  *
- * Arguments forwarded by QEMU's built-in loader (via a0/a1 in start.S):
- *   hart_id  — hardware thread ID of the boot hart (0 for single-hart QEMU)
- *   dtb      — physical address of the Flattened Device Tree blob (may be 0)
+ * U-Boot loads kernel.bin from virtio disk to 0x80200000 and jumps
+ * via `go 0x80200000`.  U-Boot passes a0=0, a1=0 (no SBI, no DTB)
+ * so we use the static memory map from QEMU's virt machine spec.
  */
 
 #include "uart.h"
@@ -56,7 +56,7 @@ void kernel_main(unsigned int hart_id, unsigned int dtb)
 
     uart_puts("\r\n");
     uart_puts("==============================================\r\n");
-    uart_puts("  RV32 Hobby OS  --  Phase 2: Bare-Metal    \r\n");
+    uart_puts("  RV32 Hobby OS  --  U-Boot + Kernel Boot   \r\n");
     uart_puts("==============================================\r\n");
     uart_puts("\r\n");
 
@@ -76,7 +76,8 @@ void kernel_main(unsigned int hart_id, unsigned int dtb)
 
     /* Memory map */
     uart_puts("[mem]  DRAM start    : 0x80000000\r\n");
-    uart_puts("[mem]  Kernel base   : 0x80000000\r\n");
+    uart_puts("[mem]  U-Boot        : 0x80000000\r\n");
+    uart_puts("[mem]  Kernel base   : 0x80200000\r\n");
     uart_puts("[mem]  UART base     : 0x10000000\r\n");
     uart_puts("[mem]  CLINT base    : 0x02000000\r\n");
     uart_puts("[mem]  PLIC base     : 0x0c000000\r\n");

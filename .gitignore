@@ -1,5 +1,10 @@
 # Build artefacts
 *.o
 *.elf
-*.bin
 *.dump
+*.img
+part1.img
+
+# Generated binaries
+kernel.bin
+boot/u-boot.bin

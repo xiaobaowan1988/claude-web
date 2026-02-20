@@ -1,0 +1,6 @@
+# RV32 Hobby OS boot script
+echo '=== RV32 Hobby OS boot script ==='
+echo 'Loading kernel.bin to 0x80200000 ...'
+fatload virtio 0:1 0x80200000 /kernel.bin
+echo 'Jumping to kernel at 0x80200000 ...'
+go 0x80200000
