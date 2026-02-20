@@ -8,3 +8,4 @@ part1.img
 # Generated binaries
 kernel.bin
 boot/u-boot.bin
+boot/boot.scr    # compiled from boot/boot.source by mkimage; timestamp changes on every build
