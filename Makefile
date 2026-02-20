@@ -57,6 +57,7 @@ LDFLAGS := $(ARCH_FLAGS)         \
 KERNEL_SRCS_S := kernel/start.S
 KERNEL_SRCS_C := kernel/uart.c \
                  kernel/pmm.c  \
+                 kernel/vm.c   \
                  kernel/main.c
 
 KERNEL_OBJS := $(KERNEL_SRCS_S:.S=.o) $(KERNEL_SRCS_C:.c=.o)

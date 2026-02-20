@@ -11,12 +11,13 @@
 
 #include "uart.h"
 #include "pmm.h"
+#include "vm.h"
 
-/* Linker-script symbols — end of kernel + stack (first free byte) */
+/* Linker-script symbol — byte after kernel stack (first free DRAM byte) */
 extern char _stack_top[];
 
 /* ------------------------------------------------------------------ */
-/* Tiny decimal printer (avoids pulling in printf/libc)                */
+/* Tiny decimal/hex printers                                           */
 /* ------------------------------------------------------------------ */
 static void print_uint(unsigned int v)
 {
@@ -52,26 +53,71 @@ static unsigned int csr_mimpid(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* PMM demo helpers                                                    */
+/* PMM helpers                                                          */
 /* ------------------------------------------------------------------ */
 static void print_pmm_stats(void)
 {
     unsigned int used, total, free_pages;
     pmm_stats(&used, &total);
     free_pages = total - used;
-
     uart_puts("[pmm]  total pages   : "); print_uint(total);
     uart_puts("  ("); print_uint(total >> 8); uart_puts(" MB)\r\n");
-
     uart_puts("[pmm]  used  pages   : "); print_uint(used);
     uart_puts("  ("); print_uint(used >> 8); uart_puts(" MB)\r\n");
-
     uart_puts("[pmm]  free  pages   : "); print_uint(free_pages);
     uart_puts("  ("); print_uint(free_pages >> 8); uart_puts(" MB)\r\n");
 }
 
 /* ------------------------------------------------------------------ */
-/* kernel_main                                                         */
+/* Phase 4 — S-mode entry                                              */
+/*                                                                      */
+/* Called via mret from vm_enter_s_mode().  At this point we are in   */
+/* S-mode but still using physical addresses.  We enable Sv32, after  */
+/* which all memory accesses go through the identity-mapped page table. */
+/* ------------------------------------------------------------------ */
+static __attribute__((noreturn)) void s_mode_entry(void)
+{
+    unsigned int sstatus, satp;
+
+    /* Confirm S-mode by reading sstatus */
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    uart_puts("[vm]   entered S-mode  (sstatus = "); uart_puthex(sstatus);
+    uart_puts("[vm]   SPP bit = ");
+    uart_putc(((sstatus >> 8) & 1) ? '1' : '0');
+    uart_puts("  (0 = came from U-mode/M, means first S-mode entry)\r\n");
+    uart_puts("\r\n");
+
+    /* Enable Sv32: writes satp and executes sfence.vma */
+    uart_puts("[vm]   enabling Sv32 ...\r\n");
+    vm_enable_sv32();
+
+    /* From this point all addresses go through the page table */
+    satp = vm_satp_val();
+    uart_puts("[vm]   satp             : "); uart_puthex(satp);
+    uart_puts("[vm]   MODE bit [31]    : ");
+    uart_putc(((satp >> 31) & 1) ? '1' : '0');
+    uart_puts("  (1 = Sv32 active)\r\n");
+    uart_puts("[vm]   root PT PPN      : "); uart_puthex(satp & 0x3FFFFFu);
+    uart_puts("\r\n");
+    uart_puts("[vm]   Sv32 ACTIVE — kernel running under virtual memory\r\n");
+    uart_puts("\r\n");
+
+    /* ---------------------------------------------------------------- */
+    uart_puts("[boot] Phase 4 complete.  Halting.\r\n");
+    uart_puts("\r\n");
+    uart_puts("Next phases:\r\n");
+    uart_puts("  Phase 5 : Trap handler + process struct + context switch\r\n");
+    uart_puts("  Phase 6 : CLINT timer interrupt + round-robin scheduler\r\n");
+    uart_puts("  Phase 7 : System calls (ecall) + ELF32 loader\r\n");
+    uart_puts("  Phase 8 : VFS + ramfs + shell\r\n");
+    uart_puts("\r\n");
+
+    while (1)
+        asm volatile("wfi");
+}
+
+/* ------------------------------------------------------------------ */
+/* kernel_main — runs in M-mode                                        */
 /* ------------------------------------------------------------------ */
 void kernel_main(unsigned int hart_id, unsigned int dtb)
 {
@@ -79,7 +125,7 @@ void kernel_main(unsigned int hart_id, unsigned int dtb)
 
     uart_puts("\r\n");
     uart_puts("==============================================\r\n");
-    uart_puts("  RV32 Hobby OS  --  Phase 3: PMM            \r\n");
+    uart_puts("  RV32 Hobby OS  --  Phase 4: Sv32 VM        \r\n");
     uart_puts("==============================================\r\n");
     uart_puts("\r\n");
 
@@ -102,59 +148,27 @@ void kernel_main(unsigned int hart_id, unsigned int dtb)
      * Phase 3 — Physical Memory Manager
      * ---------------------------------------------------------------- */
     uart_puts("--- Phase 3: Physical Memory Manager ---\r\n\r\n");
-
-    /* Initialise: reserve [PHYS_BASE .. _stack_top), free everything above */
     pmm_init((unsigned int)_stack_top);
-    uart_puts("[pmm]  init complete.  Allocatable DRAM:\r\n");
+    uart_puts("[pmm]  init complete.\r\n");
     print_pmm_stats();
     uart_puts("\r\n");
 
-    /* Allocate 4 pages and show their addresses */
-    uart_puts("[pmm]  allocating 4 pages ...\r\n");
-    void *p[4];
-    for (int i = 0; i < 4; i++) {
-        p[i] = pmm_alloc_page();
-        uart_puts("         p["); print_uint(i); uart_puts("] = ");
-        uart_puthex((unsigned int)p[i]);
-    }
-    uart_puts("\r\n");
-    print_pmm_stats();
+    /* ----------------------------------------------------------------
+     * Phase 4 — Sv32 Virtual Memory
+     * ---------------------------------------------------------------- */
+    uart_puts("--- Phase 4: Sv32 Virtual Memory ---\r\n\r\n");
+
+    uart_puts("[vm]   building page table ...\r\n");
+    vm_init();
+
+    uart_puts("[vm]   root_pt phys    : "); uart_puthex(vm_root_pt_phys());
+    uart_puts("[vm]   megapage map:\r\n");
+    uart_puts("[vm]     DRAM   0x80000000 - 0x8FFFFFFF  (64 x 4 MB, R/W/X)\r\n");
+    uart_puts("[vm]     UART   0x10000000 - 0x103FFFFF  ( 1 x 4 MB, R/W)\r\n");
+    uart_puts("[vm]     CLINT  0x02000000 - 0x023FFFFF  ( 1 x 4 MB, R/W)\r\n");
+    uart_puts("[vm]     PLIC   0x0C000000 - 0x0FFFFFFF  (16 x 4 MB, R/W)\r\n");
     uart_puts("\r\n");
 
-    /* Free page 1, then allocate again — must get the same address back */
-    uart_puts("[pmm]  freeing p[1] = "); uart_puthex((unsigned int)p[1]);
-    pmm_free_page(p[1]);
-    uart_puts("[pmm]  allocating 1 page  → ");
-    void *recycled = pmm_alloc_page();
-    uart_puthex((unsigned int)recycled);
-    if (recycled == p[1])
-        uart_puts("[pmm]  recycled correctly (same page returned)\r\n");
-    else
-        uart_puts("[pmm]  ERROR: unexpected address\r\n");
-    uart_puts("\r\n");
-    print_pmm_stats();
-    uart_puts("\r\n");
-
-    /* Free all pages back and confirm stats return to baseline */
-    uart_puts("[pmm]  freeing all 4 pages ...\r\n");
-    pmm_free_page(p[0]);
-    pmm_free_page(recycled);    /* p[1] slot */
-    pmm_free_page(p[2]);
-    pmm_free_page(p[3]);
-    print_pmm_stats();
-    uart_puts("\r\n");
-
-    /* ---------------------------------------------------------------- */
-    uart_puts("[boot] Phase 3 complete.  Halting.\r\n");
-    uart_puts("\r\n");
-    uart_puts("Next phases:\r\n");
-    uart_puts("  Phase 4 : Sv32 virtual memory + kernel page tables\r\n");
-    uart_puts("  Phase 5 : Trap/exception handler + context switch\r\n");
-    uart_puts("  Phase 6 : CLINT timer interrupt + round-robin scheduler\r\n");
-    uart_puts("  Phase 7 : ecall + ELF32 loader + first user process\r\n");
-    uart_puts("  Phase 8 : VFS + ramfs + shell\r\n");
-    uart_puts("\r\n");
-
-    while (1)
-        asm volatile("wfi");
+    uart_puts("[vm]   switching M-mode -> S-mode ...\r\n");
+    vm_enter_s_mode(s_mode_entry);   /* does not return */
 }
